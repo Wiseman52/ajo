@@ -1,0 +1,18 @@
+{
+  "default_branch": "main",
+  "branches": [
+    "fix/issue-355-app-circles-page-tsx-has-no-tests",
+    "main",
+    "origin"
+  ],
+  "parent": {
+    "fix/issue-355-app-circles-page-tsx-has-no-tests": "main",
+    "main": null,
+    "origin": "main"
+  },
+  "order": [
+    "main",
+    "fix/issue-355-app-circles-page-tsx-has-no-tests",
+    "origin"
+  ]
+}
