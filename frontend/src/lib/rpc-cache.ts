@@ -147,6 +147,7 @@ export async function missedCountCached(
  */
 export function invalidateCircleCache(circleId: bigint): void {
   const scope = cacheScope();
-  rpcCache.clearPrefix(`${scope}:contrib:${circleId}:`);
-  rpcCache.clearPrefix(`${scope}:missed:${circleId}:`);
+  const circleSegment = `${circleId}:`;
+  rpcCache.clearPrefix(`${scope}:contrib:${circleSegment}`);
+  rpcCache.clearPrefix(`${scope}:missed:${circleSegment}`);
 }
