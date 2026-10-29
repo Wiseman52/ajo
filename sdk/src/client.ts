@@ -3,11 +3,8 @@ import {
   Address,
   Contract,
   FeeBumpTransaction,
-  Keypair,
   Memo,
   Transaction,
-  TransactionBuilder,
-  BASE_FEE,
   nativeToScVal,
   scValToNative,
   rpc,
@@ -51,6 +48,9 @@ export interface Circle {
 /** Type alias for Circle (#64). */
 export type CircleState = Circle;
 
+/** Placeholder source account for read-only simulations. Must be a valid G-address. */
+const READ_ONLY_PLACEHOLDER_ACCOUNT = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5";
+
 // soroban-sdk maps Rust struct field names verbatim (snake_case) into the
 // decoded object's keys — this is the raw shape before we camelCase it.
 interface RawCircle {
@@ -79,6 +79,23 @@ function parseCircle(raw: RawCircle): Circle {
     currentCycle: raw.current_cycle,
     status: raw.status as CircleStatus,
   };
+}
+
+/**
+ * Extracts the lower bound from a Soroban RPC "startLedger must be within the
+ * ledger range: MIN - MAX" error. Returns null when the error is unrelated.
+ */
+export function minLedgerFromRangeError(err: unknown): number | null {
+  const message =
+    typeof err === "string"
+      ? err
+      : err instanceof Error
+        ? err.message
+        : typeof (err as { message?: unknown })?.message === "string"
+          ? (err as { message: string }).message
+          : "";
+  const match = /ledger range:\s*(\d+)\s*-\s*\d+/i.exec(message);
+  return match ? Number(match[1]) : null;
 }
 
 export class AjoContractError extends Error {
@@ -169,7 +186,11 @@ export class AjoClient {
   private readonly networkPassphrase: string;
 
   constructor(config: AjoClientConfig) {
-    this.server = new rpc.Server(config.rpcUrl ?? DEFAULT_RPC_URL);
+    const rpcUrl = config.rpcUrl ?? DEFAULT_RPC_URL;
+    // Local sandboxes (e.g. the standalone network on localhost) serve plain
+    // HTTP; the SDK refuses insecure RPC endpoints unless explicitly allowed.
+    const allowHttp = rpcUrl.startsWith("http://");
+    this.server = new rpc.Server(rpcUrl, { allowHttp });
     this.contract = new Contract(config.contractId);
     this.contractId = config.contractId;
     this.networkPassphrase = config.networkPassphrase ?? DEFAULT_NETWORK_PASSPHRASE;
@@ -320,50 +341,47 @@ export class AjoClient {
 
   /** Callable by anyone — no privileged keeper role. */
   async buildDisburseTx(circleId: bigint, caller: string): Promise<string> {
-    return this.buildTx(caller, "disburse", [nativeToScVal(circleId, { type: "u64" })]);
+    return this.buildTx(caller, "disburse", [
+      nativeToScVal(circleId, { type: "u64" }),
+      new Address(caller).toScVal(),
+    ]);
   }
 
   /**
-   * Submit a caller-signed transaction XDR and poll until it lands.
-   *
-   * Resolves with the contract call's decoded return value (e.g. the new
-   * circle id from `create_circle`), or `undefined` for calls that return
-   * nothing, so callers don't need a follow-up read to learn the result.
+   * Submits a caller-signed transaction XDR and polls until it resolves.
+   * Returns the transaction hash on success.
    */
-  async submitSignedTx<T = unknown>(signedXdr: string): Promise<T | undefined> {
+  async submitSignedTx(signedXdr: string): Promise<string> {
+    const { TransactionBuilder } = await import("@stellar/stellar-sdk");
     const tx = TransactionBuilder.fromXDR(signedXdr, this.networkPassphrase);
     const sent = await sendWithRetry(this.server, tx);
     if (sent.status === "ERROR") {
-      throw new AjoContractError(`Transaction rejected: ${JSON.stringify(sent.errorResult)}`);
+      throw new AjoContractError(`Transaction rejected: ${sent.errorResult?.toXDR("base64") ?? "unknown"}`);
     }
-
-    const maxAttempts = 40; // ~60s at 1.5s/poll — a dropped tx should never hang the caller forever
-    let result: rpc.Api.GetTransactionResponse | null = null;
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      try {
-        result = await this.server.getTransaction(sent.hash);
-        if (result.status !== "NOT_FOUND") {
-          break;
-        }
-      } catch (err) {
-        if (attempt === maxAttempts - 1) {
-          throw err;
-        }
+    for (let i = 0; i < 30; i++) {
+      const res = await this.server.getTransaction(sent.hash);
+      if (res.status === "SUCCESS") return sent.hash;
+      if (res.status === "FAILED") {
+        throw new AjoContractError(`Transaction failed: ${sent.hash}`);
       }
-      await new Promise((resolve) => setTimeout(resolve, 1500));
+      await new Promise((resolve) => setTimeout(resolve, 2000));
     }
-    if (!result || result.status === "NOT_FOUND") {
-      throw new AjoContractError(`Transaction ${sent.hash} was not found on-chain after ${maxAttempts} polls — it may have been dropped.`);
-    }
-    if (result.status !== "SUCCESS") {
-      throw new AjoContractError(`Transaction failed: ${JSON.stringify(result)}`);
-    }
-    return decodeReturnValue<T>(result.returnValue);
+    throw new AjoContractError(`Timed out waiting for transaction ${sent.hash}`);
   }
 
+  // ---- internals ----
+
+  /**
+   * Simulates a read-only contract call against a throwaway source account
+   * and decodes the return value. Throws `AjoContractError` on simulation
+   * failure.
+   */
   private async readCall<T>(method: string, args: xdr.ScVal[]): Promise<T> {
-    const account = new Account(Keypair.random().publicKey(), "0");
-    const tx = new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase: this.networkPassphrase })
+    const placeholder = new Account(READ_ONLY_PLACEHOLDER_ACCOUNT, "0");
+    const tx = new (await import("@stellar/stellar-sdk")).TransactionBuilder(placeholder, {
+      fee: "100",
+      networkPassphrase: this.networkPassphrase,
+    })
       .addOperation(this.contract.call(method, ...args))
       .setTimeout(30)
       .build();
@@ -372,40 +390,37 @@ export class AjoClient {
     if (rpc.Api.isSimulationError(sim)) {
       throw AjoContractError.fromSimulationError(sim.error);
     }
-    return scValToNative(sim.result!.retval) as T;
+    return decodeReturnValue<T>(sim.result?.retval) as T;
   }
 
+  /**
+   * Builds, simulates, and assembles an unsigned transaction for a write
+   * call. Returns the XDR for the caller to sign.
+   */
   private async buildTx(
-    sourcePublicKey: string,
+    source: string,
     method: string,
     args: xdr.ScVal[],
     memo?: string | Memo,
   ): Promise<string> {
-    const account = await this.server.getAccount(sourcePublicKey);
-    const builder = new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase: this.networkPassphrase })
+    const account = await this.server.getAccount(source);
+    const { TransactionBuilder, BASE_FEE } = await import("@stellar/stellar-sdk");
+    const builder = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: this.networkPassphrase,
+    })
       .addOperation(this.contract.call(method, ...args))
-      .setTimeout(60);
-
-    if (memo) {
+      .setTimeout(300);
+    if (memo !== undefined) {
       builder.addMemo(typeof memo === "string" ? Memo.text(memo) : memo);
     }
-
     const tx = builder.build();
 
     const sim = await this.server.simulateTransaction(tx);
     if (rpc.Api.isSimulationError(sim)) {
       throw AjoContractError.fromSimulationError(sim.error);
     }
-    return rpc.assembleTransaction(tx, sim).build().toXDR();
+    const assembled = rpc.assembleTransaction(tx, sim).build();
+    return assembled.toXDR();
   }
-}
-
-/** Extracts the lower bound from a Soroban RPC "startLedger must be within the ledger range: X - Y" error. */
-export function minLedgerFromRangeError(err: unknown): number | null {
-  const message =
-    typeof err === "object" && err !== null && "message" in err
-      ? String((err as { message: unknown }).message)
-      : String(err);
-  const match = /ledger range:\s*(\d+)/.exec(message);
-  return match ? Number(match[1]) : null;
 }
